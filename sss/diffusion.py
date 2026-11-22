@@ -8,14 +8,15 @@ Conventions
 * Expected numeric agreement with this contract is ``1e-6`` unless a
   docstring states a different tolerance.
 
-Every public function below is a stub: it raises ``NotImplementedError``
-until it is implemented against its docstring.  ``tests/test_diffusion.py``
-is the executable version of the contract.
+``tests/test_diffusion.py`` is the executable version of the contract.
 """
 
 from __future__ import annotations
 
 import math
+import numbers
+import random
+from collections.abc import Mapping, Sequence
 
 __all__ = [
     "SssError",
@@ -32,9 +33,78 @@ __all__ = [
 RGB_WEIGHTS = (0.2126, 0.7152, 0.0722)
 """Rec. 709 luminance weights used to combine the RGB diffusion profiles."""
 
+_MATERIAL_KEYS = ("albedo", "radius", "ior")
+_BATCH_KEYS = ("n", "seed", "color", "thickness")
+
 
 class SssError(Exception):
     """Raised when a material, a parameter or a batch configuration is invalid."""
+
+
+# ---------------------------------------------------------------------------
+# Internal validation helpers.
+# ---------------------------------------------------------------------------
+
+
+def _is_number(value: object) -> bool:
+    """True for real numbers, excluding booleans."""
+    return isinstance(value, numbers.Real) and not isinstance(value, bool)
+
+
+def _as_number(value: object, name: str) -> float:
+    """Return *value* as a float or raise :class:`SssError`."""
+    if not _is_number(value):
+        raise SssError(f"{name} must be a number, got {value!r}")
+    return float(value)
+
+
+def _non_negative(value: object, name: str) -> float:
+    """Return *value* as a float ``>= 0`` or raise :class:`SssError`."""
+    number = _as_number(value, name)
+    if not number >= 0.0:  # also rejects NaN
+        raise SssError(f"{name} must be >= 0, got {number!r}")
+    return number
+
+
+def _positive(value: object, name: str) -> float:
+    """Return *value* as a float ``> 0`` or raise :class:`SssError`."""
+    number = _as_number(value, name)
+    if not number > 0.0:  # also rejects NaN
+        raise SssError(f"{name} must be > 0, got {number!r}")
+    return number
+
+
+def _as_components(value: object, name: str) -> tuple[float, float, float]:
+    """Return a three-number sequence as a float tuple or raise :class:`SssError`."""
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise SssError(f"{name} must be a sequence of three numbers, got {value!r}")
+    components = tuple(value)
+    if len(components) != 3:
+        raise SssError(f"{name} must contain exactly three numbers, got {len(components)}")
+    for index, component in enumerate(components):
+        if not _is_number(component):
+            raise SssError(f"{name}[{index}] must be a number, got {component!r}")
+    return components  # type: ignore[return-value]
+
+
+def _clamp01(value: float) -> float:
+    """Clamp *value* to the closed unit interval."""
+    return min(1.0, max(0.0, value))
+
+
+def _require_mapping(value: object, name: str, keys: tuple[str, ...]) -> Mapping:
+    """Return *value* if it is a mapping holding *keys*; otherwise raise."""
+    if not isinstance(value, Mapping):
+        raise SssError(f"{name} must be a mapping, got {type(value).__name__}")
+    for key in keys:
+        if key not in value:
+            raise SssError(f"{name} is missing the {key!r} entry")
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Public API.
+# ---------------------------------------------------------------------------
 
 
 def diffusion_profile(r: float, radius: float) -> float:
@@ -65,7 +135,9 @@ def diffusion_profile(r: float, radius: float) -> float:
     SssError
         If ``r < 0`` or ``radius <= 0``.
     """
-    raise NotImplementedError
+    distance = _non_negative(r, "r")
+    scatter_radius = _positive(radius, "radius")
+    return math.exp(-distance / scatter_radius) / scatter_radius
 
 
 def total_profile(
@@ -86,7 +158,15 @@ def total_profile(
     Raises ``SssError`` if ``r < 0``, ``len(radii) != 3`` or any radius is
     not strictly positive.
     """
-    raise NotImplementedError
+    distance = _non_negative(r, "r")
+    channels = _as_components(radii, "radii")
+    for index, channel_radius in enumerate(channels):
+        if channel_radius <= 0.0:
+            raise SssError(f"radii[{index}] must be > 0, got {channel_radius!r}")
+    return sum(
+        weight * diffusion_profile(distance, channel_radius)
+        for weight, channel_radius in zip(RGB_WEIGHTS, channels)
+    )
 
 
 def sample_offsets(n: int, radius: float, seed: int) -> list[tuple[float, float]]:
@@ -104,7 +184,22 @@ def sample_offsets(n: int, radius: float, seed: int) -> list[tuple[float, float]
 
     Raises ``SssError`` if ``n <= 0`` or ``radius <= 0``.
     """
-    raise NotImplementedError
+    if not isinstance(n, int) or isinstance(n, bool):
+        raise SssError(f"n must be an integer, got {n!r}")
+    if n <= 0:
+        raise SssError(f"n must be > 0, got {n!r}")
+    scatter_radius = _positive(radius, "radius")
+    if not isinstance(seed, int) or isinstance(seed, bool):
+        raise SssError(f"seed must be an integer, got {seed!r}")
+
+    rng = random.Random(seed)
+    return [
+        (
+            rng.uniform(-scatter_radius, scatter_radius),
+            rng.uniform(-scatter_radius, scatter_radius),
+        )
+        for _ in range(n)
+    ]
 
 
 def blur_weight(dist: float, radius: float) -> float:
@@ -123,7 +218,9 @@ def blur_weight(dist: float, radius: float) -> float:
 
     Raises ``SssError`` if ``dist < 0`` or ``radius <= 0``.
     """
-    raise NotImplementedError
+    distance = _non_negative(dist, "dist")
+    scatter_radius = _positive(radius, "radius")
+    return math.exp(-distance / scatter_radius)
 
 
 def apply_sss(
@@ -151,7 +248,17 @@ def apply_sss(
     of its keys, ``albedo`` is not three numeric components or
     ``radius <= 0``.
     """
-    raise NotImplementedError
+    slab_thickness = _non_negative(thickness, "thickness")
+    material = _require_mapping(material, "material", _MATERIAL_KEYS)
+    albedo = _as_components(material["albedo"], "albedo")
+    scatter_radius = _positive(material["radius"], "radius")
+    incoming = _as_components(color, "color")
+
+    attenuation = math.exp(-slab_thickness / scatter_radius)
+    return tuple(
+        _clamp01(component * albedo_component * attenuation)
+        for component, albedo_component in zip(incoming, albedo)
+    )
 
 
 def fresnel(cos_theta: float, ior: float) -> float:
@@ -171,7 +278,14 @@ def fresnel(cos_theta: float, ior: float) -> float:
     Raises ``SssError`` if ``ior <= 1`` (checked before any division) or
     ``cos_theta`` is outside ``[0, 1]``.
     """
-    raise NotImplementedError
+    # Validate the denominator first: a bad ior must never reach a division.
+    if not _is_number(ior) or not ior > 1.0:  # `not >` also rejects NaN
+        raise SssError(f"ior must be a number > 1, got {ior!r}")
+    if not _is_number(cos_theta) or not 0.0 <= cos_theta <= 1.0:
+        raise SssError(f"cos_theta must be in [0, 1], got {cos_theta!r}")
+
+    f0 = ((ior - 1.0) / (ior + 1.0)) ** 2
+    return f0 + (1.0 - f0) * (1.0 - cos_theta) ** 5
 
 
 def validate(material: dict) -> list[str]:
@@ -195,7 +309,24 @@ def validate(material: dict) -> list[str]:
 
     Always returns ``list[str]`` when it returns (possibly empty).
     """
-    raise NotImplementedError
+    material = _require_mapping(material, "material", _MATERIAL_KEYS)
+    albedo = _as_components(material["albedo"], "albedo")
+    radius = material["radius"]
+    ior = material["ior"]
+    if not _is_number(radius):
+        raise SssError(f"radius must be a number, got {radius!r}")
+    if not _is_number(ior):
+        raise SssError(f"ior must be a number, got {ior!r}")
+
+    problems: list[str] = []
+    if not radius > 0:
+        problems.append(f"radius must be greater than 0 mm, got {radius!r}")
+    for index, component in enumerate(albedo):
+        if not 0.0 <= component <= 1.0:
+            problems.append(f"albedo[{index}] must be in [0, 1], got {component!r}")
+    if not ior > 1:
+        problems.append(f"ior must be greater than 1, got {ior!r}")
+    return problems
 
 
 def sss_batch(materials: dict, config: dict) -> dict:
@@ -225,4 +356,43 @@ def sss_batch(materials: dict, config: dict) -> dict:
     and no partial result is produced.  Also raises ``SssError`` when
     ``materials`` is empty, ``config`` is malformed or ``n <= 0``.
     """
-    raise NotImplementedError
+    if not isinstance(materials, Mapping):
+        raise SssError(f"materials must be a mapping, got {type(materials).__name__}")
+    if not materials:
+        raise SssError("materials must not be empty")
+
+    config = _require_mapping(config, "config", _BATCH_KEYS)
+
+    n = config["n"]
+    if not isinstance(n, int) or isinstance(n, bool):
+        raise SssError(f"config['n'] must be an integer, got {n!r}")
+    if n <= 0:
+        raise SssError(f"config['n'] must be > 0, got {n!r}")
+
+    seed = config["seed"]
+    if not isinstance(seed, int) or isinstance(seed, bool):
+        raise SssError(f"config['seed'] must be an integer, got {seed!r}")
+
+    color = _as_components(config["color"], "config['color']")
+    if any(not 0.0 <= component <= 1.0 for component in color):
+        raise SssError(f"config['color'] components must be in [0, 1], got {color!r}")
+
+    thickness = _non_negative(config["thickness"], "config['thickness']")
+
+    # Validate every material before computing anything: the batch is atomic.
+    failures = []
+    for name, material in materials.items():
+        problems = validate(material)
+        if problems:
+            failures.append(f"{name!r}: {'; '.join(problems)}")
+    if failures:
+        raise SssError("invalid material(s): " + " | ".join(failures))
+
+    result: dict = {}
+    for index, (name, material) in enumerate(materials.items()):
+        # Each material gets its own sample set, offset by its insertion index.
+        result[name] = {
+            "offsets": sample_offsets(n, material["radius"], seed + index),
+            "color": apply_sss(color, thickness, material),
+        }
+    return result
